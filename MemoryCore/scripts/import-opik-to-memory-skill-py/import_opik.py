@@ -36,9 +36,16 @@ from typing import Any, Iterable, Optional
 # ──────────────────────────── HTTP 小工具（不带任何第三方依赖） ────────────────────────────
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Fail closed instead of forwarding service credentials to redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class HttpError(Exception):
     def __init__(self, status: int, message: str, body: str = "") -> None:
-        super().__init__(f"HTTP {status}: {message}")
+        super().__init__(f"HTTP {status}: request failed")
         self.status = status
         self.message = message
         self.body = body
@@ -61,11 +68,12 @@ def http_request(
         hdrs.setdefault("Content-Type", "application/json")
     hdrs.setdefault("Accept", "application/json")
 
+    opener = urllib.request.build_opener(_NoRedirect())
     last_err: Optional[Exception] = None
     for attempt in range(retries + 1):
         req = urllib.request.Request(url, data=payload, method=method, headers=hdrs)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 raw = resp.read()
                 if not raw:
                     return None
@@ -75,7 +83,8 @@ def http_request(
                     return raw.decode("utf-8", errors="replace")
         except urllib.error.HTTPError as err:
             body = err.read().decode("utf-8", errors="replace") if err.fp else ""
-            # 4xx（除 429）直接抛，不重试
+            # Redirects and 4xx (except 429) fail without retry. A redirect must
+            # never forward the Opik or Core service credential to another URL.
             if err.code < 500 and err.code != 429:
                 raise HttpError(err.code, err.reason or "http error", body)
             last_err = HttpError(err.code, err.reason or "http error", body)
@@ -541,11 +550,12 @@ class MemoryCoreClient:
             timeout=self.timeout,
             retries=self.retries,
         )
-        if not isinstance(resp, dict) or resp.get("code") != 0:
-            code = resp.get("code") if isinstance(resp, dict) else "?"
-            msg = resp.get("message") if isinstance(resp, dict) else str(resp)
-            rid = resp.get("request_id", "-") if isinstance(resp, dict) else "-"
-            raise RuntimeError(f"{path} 失败: code={code} message={msg} request_id={rid}")
+        if (not isinstance(resp, dict)
+                or type(resp.get("code")) not in (int, float)
+                or resp["code"] != 0):
+            # Backend response fields may contain memory or credentials. Keep
+            # the default exception text independent of their values.
+            raise RuntimeError(f"{path} failed: invalid response or non-zero application code")
         return resp.get("data") or {}
 
     def conversation_add(self, session_id: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -614,13 +624,12 @@ def import_session(
                 status = result.get("status")
                 if status == "archived":
                     stats["archived"] += 1
-                    tid = (result.get("archived") or {}).get("task_id", "-")
-                    logger.info(f"[archived] {session.session_id} turn={idx}/{len(turns)} task={tid}")
+                    logger.info(f"[archived] {session.session_id} turn={idx}/{len(turns)}")
                 else:
-                    logger.info(f"[ok] {session.session_id} turn={idx}/{len(turns)} status={status}")
+                    logger.info(f"[ok] {session.session_id} turn={idx}/{len(turns)}")
             except Exception as err:  # noqa: BLE001
                 stats["errors"] += 1
-                logger.warning(f"[error] {session.session_id} turn={idx}/{len(turns)}: {err}")
+                logger.warning(f"[error] {session.session_id} turn={idx}/{len(turns)} ({type(err).__name__})")
         # 轮之间 sleep（最后一轮不用 sleep）
         if idx < len(turns) and turn_gap_s > 0:
             time.sleep(turn_gap_s)
@@ -630,11 +639,11 @@ def import_session(
             result = core.force_archive(session.session_id)
             if result.get("status") == "archived":
                 stats["force_archived"] = 1
-                logger.info(f"[force-archived] {session.session_id} task={result.get('task_id')}")
+                logger.info(f"[force-archived] {session.session_id}")
             else:
-                logger.info(f"[force-archive skip] {session.session_id} status={result.get('status')}")
+                logger.info(f"[force-archive skip] {session.session_id}")
         except Exception as err:  # noqa: BLE001
-            logger.warning(f"[force-archive error] {session.session_id}: {err}")
+            logger.warning(f"[force-archive error] {session.session_id} ({type(err).__name__})")
             stats["errors"] += 1
 
     logger.info(f"[session done] {session.session_id} {stats}")
